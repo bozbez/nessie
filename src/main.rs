@@ -6,14 +6,17 @@ use parity_util_mem::{malloc_size, MallocSizeOf};
 use regex::Regex;
 use rustc_hash::{FxHashMap, FxHashSet};
 
-use std::fs::File;
-use std::io::{prelude::*, BufReader};
-use std::iter::FromIterator;
 use std::cmp;
+use std::fs::File;
+use std::io::{prelude::*, BufReader, BufWriter};
+use std::iter::FromIterator;
 
 #[derive(Clap)]
 struct Opts {
     input: String,
+
+    #[clap(short, long)]
+    output: Option<String>,
 
     #[clap(short, long)]
     stop_words: String,
@@ -21,7 +24,6 @@ struct Opts {
     #[clap(short, long, default_value = "64")]
     half_para_len: usize,
 }
-
 
 #[derive(MallocSizeOf)]
 struct Chain {
@@ -132,15 +134,17 @@ impl Chain {
 fn main() -> std::io::Result<()> {
     let opts = Opts::parse();
     println!(
-        "input file: {}, stop words file: {}\n",
-        opts.input, opts.stop_words
+        "input: {}, output: {}, stop words: {}\n",
+        opts.input,
+        opts.output.clone().unwrap_or("none".to_string()),
+        opts.stop_words
     );
 
     let stop_words = std::fs::read_to_string(opts.stop_words)?;
     let stop_words = FxHashSet::<_>::from_iter(stop_words.split("\n"));
 
-    let file = File::open(opts.input)?;
-    let reader = BufReader::new(file);
+    let input = File::open(opts.input)?;
+    let reader = BufReader::new(input);
 
     let re1 = Regex::new(r"[^\w\s]").unwrap();
     let re2 = Regex::new(r"\s\s+").unwrap();
@@ -170,5 +174,13 @@ fn main() -> std::io::Result<()> {
     }
 
     chain.print_info(true);
+
+    if let Some(output) = opts.output {
+        let output = File::create(output)?;
+        let mut writer = BufWriter::new(output);
+
+        serde_pickle::to_writer(&mut writer, &chain.chain, true).unwrap();
+    }
+
     Ok(())
 }
