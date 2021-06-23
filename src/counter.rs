@@ -1,13 +1,14 @@
 use rustc_hash::FxHashMap;
+use std::hash::Hash;
 
-pub struct Counter<'a> {
-    items: Vec<(&'a str, i32)>,
-    indicies: FxHashMap<&'a str, usize>,
+pub struct Counter<T: Eq + Hash + Clone> {
+    items: Vec<(T, usize)>,
+    indicies: FxHashMap<T, usize>,
 
     total: usize,
 }
 
-impl<'a> Counter<'a> {
+impl<T: Eq + Hash + Clone> Counter<T> {
     pub fn new() -> Self {
         Counter {
             items: Vec::new(),
@@ -32,14 +33,14 @@ impl<'a> Counter<'a> {
 
         self.items.swap(i1, i2);
 
-        *self.indicies.get_mut(self.items[i1].0).unwrap() = i1;
-        *self.indicies.get_mut(self.items[i2].0).unwrap() = i2;
+        *self.indicies.get_mut(&self.items[i1].0).unwrap() = i1;
+        *self.indicies.get_mut(&self.items[i2].0).unwrap() = i2;
     }
 
-    pub fn add(&mut self, key: &'a str) {
+    pub fn add(&mut self, key: T) {
         self.total += 1;
 
-        let entry = self.indicies.entry(key).or_insert(self.items.len());
+        let entry = self.indicies.entry(key.clone()).or_insert(self.items.len());
         let i1 = *entry;
 
         if i1 == self.items.len() {
@@ -65,10 +66,10 @@ impl<'a> Counter<'a> {
         }
     }
 
-    pub fn remove(&mut self, key: &str) {
+    pub fn remove(&mut self, key: T) {
         self.total -= 1;
 
-        let entry = self.indicies.get_mut(key).unwrap();
+        let entry = self.indicies.get_mut(&key).unwrap();
         let i1 = *entry;
 
         self.items[i1].1 -= 1;
@@ -77,7 +78,7 @@ impl<'a> Counter<'a> {
         if count == 0 {
             self.swap(i1, self.items.len() - 1);
             self.items.remove(self.items.len() - 1);
-            self.indicies.remove(key);
+            self.indicies.remove(&key);
 
             return;
         }
@@ -97,7 +98,7 @@ impl<'a> Counter<'a> {
         }
     }
 
-    pub fn most_frequent(&self, n: usize) -> Option<(&str, i32)> {
-        return self.items.get(n - 1).map(|v| *v);
+    pub fn most_frequent(&self, n: usize) -> Option<&(T, usize)> {
+        return self.items.get(n - 1);
     }
 }

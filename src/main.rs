@@ -1,8 +1,9 @@
 mod counter;
 
 use clap::Clap;
+use counter::Counter;
 use deunicode::deunicode;
-use parity_util_mem::{malloc_size, MallocSizeOf};
+use parity_util_mem::malloc_size;
 use regex::Regex;
 use rustc_hash::{FxHashMap, FxHashSet};
 
@@ -21,25 +22,27 @@ struct Opts {
     #[clap(short, long)]
     stop_words: String,
 
-    #[clap(short, long, default_value = "64")]
+    #[clap(long, default_value = "64")]
     half_para_len: usize,
+
+    #[clap(long, default_value = "1024")]
+    prune_period: usize,
+
+    #[clap(long, default_value = "16")]
+    prune_threshold: usize,
 }
 
-#[derive(MallocSizeOf)]
 struct Chain {
     half_para_len: usize,
-    chain: FxHashMap<String, Vec<(i32, String)>>,
+    chain: FxHashMap<String, FxHashMap<String, Vec<(i32, String)>>>,
 }
 
 impl Chain {
     fn new(half_para_len: usize) -> Self {
-        let mut chain = Chain {
+        Chain {
             half_para_len,
             chain: FxHashMap::default(),
-        };
-
-        chain.chain.reserve(30_000_000);
-        chain
+        }
     }
 
     fn update(&mut self, words: &[&str]) {
@@ -50,7 +53,7 @@ impl Chain {
         let mut seq_num = 0;
         let mut previous_topic_bigram = String::new();
 
-        let mut counter = counter::Counter::new();
+        let mut counter = Counter::<&str>::new();
 
         for i in 0..(words.len() - 1) {
             let start = i.saturating_sub(self.half_para_len);
@@ -101,9 +104,10 @@ impl Chain {
                     words[i + 2]
                 };
 
-            let key = bigram + " @ " + &topic_bigram;
             self.chain
-                .entry(key)
+                .entry(bigram)
+                .or_insert(FxHashMap::default())
+                .entry(topic_bigram)
                 .or_insert(Vec::new())
                 .push((seq_num, next_bigram));
 
@@ -111,10 +115,12 @@ impl Chain {
         }
     }
 
-    fn merge(&mut self, other: Chain) {
-        for (k, mut v) in other.chain {
-            self.chain.entry(k).or_insert(Vec::new()).append(&mut v);
-        }
+    fn prune(&mut self, threshold: usize) {
+        self.chain.retain(|_, v| v.len() >= threshold);
+    }
+
+    fn shrink_to_fit(&mut self) {
+        self.chain.shrink_to_fit();
     }
 
     fn print_info(&self, print_mem: bool) {
@@ -123,7 +129,7 @@ impl Chain {
         if print_mem {
             println!(
                 " using {:.3}GiB",
-                malloc_size(self) as f64 / (1024.0 * 1024.0 * 1024.0)
+                malloc_size(&self.chain) as f64 / bytesize::GIB as f64
             );
         } else {
             println!();
@@ -140,46 +146,66 @@ fn main() -> std::io::Result<()> {
         opts.stop_words
     );
 
+    println!(
+        "prune threshold: {}, prune period: {}",
+        opts.prune_threshold, opts.prune_period
+    );
+
+    let re = Regex::new(r"[^\w\s]").unwrap();
+
     let stop_words = std::fs::read_to_string(opts.stop_words)?;
-    let stop_words = FxHashSet::<_>::from_iter(stop_words.split("\n"));
+    let stop_words = re.replace_all(&stop_words, "").to_string();
+    let stop_words = FxHashSet::<_>::from_iter(stop_words.split_ascii_whitespace());
 
     let input = File::open(opts.input)?;
     let reader = BufReader::new(input);
-
-    let re1 = Regex::new(r"[^\w\s]").unwrap();
-    let re2 = Regex::new(r"\s\s+").unwrap();
 
     let mut chain = Chain::new(opts.half_para_len);
 
     for (i, line) in reader.lines().enumerate() {
         let mut line = match line {
-            Ok(line) => deunicode(&line).to_lowercase(),
+            Ok(line) => deunicode(&line),
             Err(_) => break,
         };
 
-        line = re1.replace(&line, "").to_string();
-        line = re2.replace(&line, " ").to_string();
+        line = re.replace_all(&line, "").to_string();
 
+        line.make_ascii_lowercase();
         line = line.replace(" th ", " nth ");
 
         let words: Vec<&str> = line
-            .split(" ")
+            .split_ascii_whitespace()
             .filter(|s| !stop_words.contains(s))
             .collect();
 
         chain.update(&words);
 
+        if i % opts.prune_period == 0 {
+            chain.prune(opts.prune_threshold);
+        }
+
         print!("{:07}: {} ... ", i + 1, &line[0..72]);
         chain.print_info(false);
     }
 
+    chain.prune(opts.prune_threshold);
+    chain.shrink_to_fit();
+
+    println!();
     chain.print_info(true);
 
     if let Some(output) = opts.output {
+        println!("writing to {}...", output);
+
         let output = File::create(output)?;
         let mut writer = BufWriter::new(output);
 
         serde_pickle::to_writer(&mut writer, &chain.chain, true).unwrap();
+
+        println!(
+            "{:.3}GiB written",
+            writer.get_ref().metadata()?.len() as f64 / bytesize::GIB as f64
+        );
     }
 
     Ok(())

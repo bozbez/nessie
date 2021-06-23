@@ -75,6 +75,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b700ce4376041dcd0a327fd0097c41095743c4c8af8887265942faf1100bd040"
 
 [[package]]
+name = "bytesize"
+version = "1.0.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "81a18687293a1546b67c246452202bbbf143d239cb43494cc163da14979082da"
+
+[[package]]
 name = "cfg-if"
 version = "1.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -316,6 +322,7 @@ checksum = "b16bd47d9e329435e309c58469fe0791c2d0d1ba96ec0954152a5ae2b04387dc"
 name = "nessie"
 version = "0.1.0"
 dependencies = [
+ "bytesize",
  "clap",
  "deunicode",
  "parity-util-mem",
