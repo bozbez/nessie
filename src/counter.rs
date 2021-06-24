@@ -1,9 +1,9 @@
-use rustc_hash::FxHashMap;
+use hashbrown::HashMap;
 use std::hash::Hash;
 
 pub struct Counter<T: Eq + Hash + Clone> {
     items: Vec<(T, usize)>,
-    indicies: FxHashMap<T, usize>,
+    indicies: HashMap<T, usize>,
 
     total: usize,
 }
@@ -12,7 +12,7 @@ impl<T: Eq + Hash + Clone> Counter<T> {
     pub fn new() -> Self {
         Counter {
             items: Vec::new(),
-            indicies: FxHashMap::default(),
+            indicies: HashMap::new(),
 
             total: 0,
         }

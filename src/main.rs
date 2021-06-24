@@ -1,16 +1,23 @@
+#![feature(allocator_api)]
+
 mod counter;
 
+use bumpalo::Bump;
 use clap::Clap;
 use counter::Counter;
 use deunicode::deunicode;
-use parity_util_mem::malloc_size;
+use hashbrown::{HashMap, HashSet};
 use regex::Regex;
-use rustc_hash::{FxHashMap, FxHashSet};
+use smartstring::SmartString;
 
+use std::cell::UnsafeCell;
 use std::cmp;
 use std::fs::File;
 use std::io::{prelude::*, BufReader, BufWriter};
 use std::iter::FromIterator;
+use std::mem;
+use std::ptr;
+use std::time::Instant;
 
 #[derive(Clap)]
 struct Opts {
@@ -25,24 +32,60 @@ struct Opts {
     #[clap(long, default_value = "64")]
     half_para_len: usize,
 
-    #[clap(long, default_value = "1024")]
-    prune_period: usize,
+    #[clap(long, default_value = "2.0")]
+    prune_size_gib: f64,
 
     #[clap(long, default_value = "16")]
     prune_threshold: usize,
 }
 
-struct Chain {
+type BHashMap<'a, K, V> = HashMap<K, V, ahash::RandomState, &'a Bump>;
+type BVec<'a, T> = Vec<T, &'a Bump>;
+
+type Unigram = SmartString<smartstring::LazyCompact>;
+type Bigram = (Unigram, Unigram);
+
+type ChainMap<'a> = BHashMap<'a, Bigram, BHashMap<'a, Bigram, BVec<'a, (i32, Unigram)>>>;
+
+struct Chain<'a> {
     half_para_len: usize,
-    chain: FxHashMap<String, FxHashMap<String, Vec<(i32, String)>>>,
+    prune_size: usize,
+    prune_threshold: usize,
+
+    chain: ChainMap<'a>,
+
+    pools: Vec<UnsafeCell<Bump>>,
+    active_pool: usize,
 }
 
-impl Chain {
-    fn new(half_para_len: usize) -> Self {
+impl<'a> Chain<'a> {
+    fn new(half_para_len: usize, prune_size: usize, prune_threshold: usize) -> Self {
+        let pools = vec![
+            UnsafeCell::new(Bump::with_capacity((prune_size as f64 * 1.1) as usize)),
+            UnsafeCell::new(Bump::with_capacity((prune_size as f64 * 1.1) as usize)),
+        ];
+
         Chain {
             half_para_len,
-            chain: FxHashMap::default(),
+            prune_size,
+            prune_threshold,
+
+            chain: BHashMap::with_capacity_in(prune_size / 1000, unsafe {
+                mem::transmute(pools[0].get())
+            }),
+
+            pools,
+            active_pool: 0,
         }
+    }
+
+    fn active_pool(&self) -> &'a Bump {
+        unsafe { mem::transmute(self.pools[self.active_pool].get()) }
+    }
+
+    fn advance_pool(&mut self) -> &'a Bump {
+        self.active_pool = (self.active_pool + 1) % self.pools.len();
+        self.active_pool()
     }
 
     fn update(&mut self, words: &[&str]) {
@@ -50,8 +93,10 @@ impl Chain {
             return;
         }
 
+        let pool = self.active_pool();
+
         let mut seq_num = 0;
-        let mut previous_topic_bigram = String::new();
+        let mut previous_topic_bigram = (Unigram::from(""), Unigram::from(""));
 
         let mut counter = Counter::<&str>::new();
 
@@ -86,50 +131,105 @@ impl Chain {
                 break;
             }
 
-            let topic_bigram = (counter.most_frequent(1).unwrap().0).to_owned()
-                + " "
-                + counter.most_frequent(2).unwrap().0;
+            let topic_bigram = (
+                Unigram::from(counter.most_frequent(1).unwrap().0),
+                Unigram::from(counter.most_frequent(2).unwrap().0),
+            );
 
             if topic_bigram != previous_topic_bigram {
                 seq_num = 0;
                 previous_topic_bigram = topic_bigram.clone();
             }
 
-            let bigram = words[i].to_owned() + " " + words[i + 1];
-            let next_bigram = words[i + 1].to_owned()
-                + " "
-                + if i + 2 >= words.len() {
-                    "$"
-                } else {
-                    words[i + 2]
-                };
+            let next_unigram = if i + 2 >= words.len() {
+                Unigram::from("$")
+            } else {
+                Unigram::from(words[i + 2])
+            };
 
             self.chain
-                .entry(bigram)
-                .or_insert(FxHashMap::default())
+                .entry((Unigram::from(words[i]), Unigram::from(words[i + 1])))
+                .or_insert(BHashMap::new_in(pool))
                 .entry(topic_bigram)
-                .or_insert(Vec::new())
-                .push((seq_num, next_bigram));
+                .or_insert(BVec::new_in(pool))
+                .push((seq_num, next_unigram));
 
             seq_num += 1;
         }
+
+        if self.allocated_bytes() > self.prune_size {
+            self.prune();
+        }
     }
 
-    fn prune(&mut self, threshold: usize) {
-        self.chain.retain(|_, v| v.len() >= threshold);
+    unsafe fn drop_unigram(u: &Unigram) {
+        if u.is_inline() {
+            return;
+        }
+
+        let cptr = u as *const Unigram;
+        ptr::drop_in_place(cptr as *mut Unigram);
     }
 
-    fn shrink_to_fit(&mut self) {
-        self.chain.shrink_to_fit();
+    unsafe fn drop_bigram(b: &(Unigram, Unigram)) {
+        Self::drop_unigram(&b.0);
+        Self::drop_unigram(&b.1);
+    }
+
+    fn prune(&mut self) {
+        let old_pool_id = self.active_pool;
+        let new_pool = self.advance_pool();
+
+        let new_size = (self.num_entries() as f64 * 1.4) as usize;
+
+        let mut new_chain = BHashMap::with_capacity_in(new_size, new_pool);
+        for (bigram, topic_map) in self
+            .chain
+            .iter()
+            .filter(|(_, topic_map)| topic_map.len() >= self.prune_threshold)
+        {
+            let mut new_topic_map = BHashMap::with_capacity_in(topic_map.len(), new_pool);
+            for (topic, unigrams) in topic_map.iter() {
+                let mut new_unigrams = BVec::with_capacity_in(unigrams.len(), new_pool);
+
+                for unigram in unigrams {
+                    new_unigrams.push(unigram.clone());
+                    unsafe { Self::drop_unigram(&unigram.1) }
+                }
+
+                new_topic_map.insert(topic.clone(), new_unigrams);
+                unsafe { Self::drop_bigram(topic) }
+            }
+
+            new_chain.insert(bigram.clone(), new_topic_map);
+            unsafe { Self::drop_bigram(bigram) }
+        }
+
+        mem::swap(&mut self.chain, &mut new_chain);
+        mem::forget(new_chain);
+
+        unsafe { self.reset_pool(old_pool_id) }
+    }
+
+    unsafe fn reset_pool(&mut self, id: usize) {
+        self.pools[id].get_mut().reset();
+    }
+
+    fn num_entries(&self) -> usize {
+        self.chain.len()
+    }
+
+    fn allocated_bytes(&self) -> usize {
+        self.active_pool().allocated_bytes()
     }
 
     fn print_info(&self, print_mem: bool) {
-        print!("{:010} entries", self.chain.len());
+        print!("{:010} entries", self.num_entries());
 
         if print_mem {
             println!(
-                " using {:.3}GiB",
-                malloc_size(&self.chain) as f64 / bytesize::GIB as f64
+                " using ~{:.3}GiB",
+                self.allocated_bytes() as f64 / bytesize::GIB as f64
             );
         } else {
             println!();
@@ -147,22 +247,31 @@ fn main() -> std::io::Result<()> {
     );
 
     println!(
-        "prune threshold: {}, prune period: {}",
-        opts.prune_threshold, opts.prune_period
+        "prune threshold: {}, prune size: {}GiB",
+        opts.prune_threshold, opts.prune_size_gib
     );
 
     let re = Regex::new(r"[^\w\s]").unwrap();
 
     let stop_words = std::fs::read_to_string(opts.stop_words)?;
     let stop_words = re.replace_all(&stop_words, "").to_string();
-    let stop_words = FxHashSet::<_>::from_iter(stop_words.split_ascii_whitespace());
+    let stop_words = HashSet::<_>::from_iter(stop_words.split_ascii_whitespace());
 
     let input = File::open(opts.input)?;
     let reader = BufReader::new(input);
 
-    let mut chain = Chain::new(opts.half_para_len);
+    let mut chain = Chain::new(
+        opts.half_para_len,
+        (opts.prune_size_gib * (bytesize::GIB as f64)) as usize,
+        opts.prune_threshold,
+    );
+
+    let start = Instant::now();
+    let mut section_times = (0f64, 0f64);
 
     for (i, line) in reader.lines().enumerate() {
+        let mut section_start = Instant::now();
+
         let mut line = match line {
             Ok(line) => deunicode(&line),
             Err(_) => break,
@@ -178,20 +287,29 @@ fn main() -> std::io::Result<()> {
             .filter(|s| !stop_words.contains(s))
             .collect();
 
+        section_times.0 += section_start.elapsed().as_secs_f64();
+        section_start = Instant::now();
+
         chain.update(&words);
 
-        if i % opts.prune_period == 0 {
-            chain.prune(opts.prune_threshold);
-        }
+        section_times.1 += section_start.elapsed().as_secs_f64();
 
         print!("{:07}: {} ... ", i + 1, &line[0..72]);
-        chain.print_info(false);
+        chain.print_info(true);
     }
 
-    chain.prune(opts.prune_threshold);
-    chain.shrink_to_fit();
+    let duration = start.elapsed();
 
     println!();
+
+    println!(
+        "finished in {:.3}s ({:.3}s, {:.3}s), cleaning up...",
+        duration.as_secs_f64(),
+        section_times.0,
+        section_times.1,
+    );
+
+    chain.prune();
     chain.print_info(true);
 
     if let Some(output) = opts.output {
@@ -200,7 +318,7 @@ fn main() -> std::io::Result<()> {
         let output = File::create(output)?;
         let mut writer = BufWriter::new(output);
 
-        serde_pickle::to_writer(&mut writer, &chain.chain, true).unwrap();
+        // serde_pickle::to_writer(&mut writer, &chain.chain, true).unwrap();
 
         println!(
             "{:.3}GiB written",
