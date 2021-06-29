@@ -11,7 +11,6 @@ use regex::Regex;
 
 use std::fs::File;
 use std::io::{prelude::*, BufReader, BufWriter};
-use std::iter::FromIterator;
 use std::time::Instant;
 
 #[derive(Clap)]
@@ -41,7 +40,7 @@ fn print_opts(opts: &Opts) {
     println!(
         "input: {}, output: {}, stop words: {}",
         opts.input,
-        opts.output.clone().unwrap_or("none".to_string()),
+        opts.output.clone().unwrap_or_else(|| "none".to_string()),
         opts.stop_words
     );
 
@@ -60,7 +59,7 @@ impl<'a> LineProcessor<'a> {
     fn new(stop_words: &'a str) -> Self {
         LineProcessor {
             special_chars_re: Regex::new(r"[^\w\s]").unwrap(),
-            stop_words: HashSet::<_>::from_iter(stop_words.split_ascii_whitespace()),
+            stop_words: stop_words.split_ascii_whitespace().collect(),
         }
     }
 

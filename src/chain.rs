@@ -46,8 +46,8 @@ impl<'a> Chain<'a> {
             hasher: hasher.clone(),
             chain: BChainMap::with_capacity_and_hasher_in(
                 prune_size / 1000,
-                hasher.clone(),
-                unsafe { mem::transmute(pools[0].get()) },
+                hasher,
+                unsafe { &*pools[0].get() },
             ),
 
             pools,
@@ -56,7 +56,7 @@ impl<'a> Chain<'a> {
     }
 
     fn active_pool(&self) -> &'a Bump {
-        unsafe { mem::transmute(self.pools[self.active_pool].get()) }
+        unsafe { &*self.pools[self.active_pool].get() }
     }
 
     fn advance_pool(&mut self) -> &'a Bump {

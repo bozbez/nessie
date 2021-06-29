@@ -19,11 +19,11 @@ impl<T: Eq + Hash + Clone> Counter<T> {
     }
 
     pub fn total_count(&self) -> usize {
-        return self.total;
+        self.total
     }
 
     pub fn num_items(&self) -> usize {
-        return self.items.len();
+        self.items.len()
     }
 
     fn update_index(&mut self, i: usize) {
@@ -105,6 +105,6 @@ impl<T: Eq + Hash + Clone> Counter<T> {
     }
 
     pub fn most_frequent(&self, n: usize) -> Option<&(T, usize)> {
-        return self.items.get(n - 1);
+        self.items.get(n - 1)
     }
 }
