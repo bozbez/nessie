@@ -26,6 +26,10 @@ impl<T: Eq + Hash + Clone> Counter<T> {
         return self.items.len();
     }
 
+    fn update_index(&mut self, i: usize) {
+        *self.indicies.get_mut(&self.items[i].0).unwrap() = i;
+    }
+
     fn swap(&mut self, i1: usize, i2: usize) {
         if i1 == i2 {
             return;
@@ -33,8 +37,8 @@ impl<T: Eq + Hash + Clone> Counter<T> {
 
         self.items.swap(i1, i2);
 
-        *self.indicies.get_mut(&self.items[i1].0).unwrap() = i1;
-        *self.indicies.get_mut(&self.items[i2].0).unwrap() = i2;
+        self.update_index(i1);
+        self.update_index(i2);
     }
 
     pub fn add(&mut self, key: T) {
@@ -76,7 +80,9 @@ impl<T: Eq + Hash + Clone> Counter<T> {
         let count = self.items[i1].1;
 
         if count == 0 {
-            self.swap(i1, self.items.len() - 1);
+            self.items[i1] = self.items[self.items.len() - 1].clone();
+            self.update_index(i1);
+
             self.items.remove(self.items.len() - 1);
             self.indicies.remove(&key);
 
