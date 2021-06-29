@@ -3,7 +3,7 @@ use bumpalo::Bump;
 use hashbrown::HashMap;
 use smartstring::SmartString;
 
-use std::{cell::UnsafeCell, cmp::min, mem, hash::Hash};
+use std::{cell::UnsafeCell, cmp::min, hash::Hash, mem};
 
 pub type Unigram = SmartString<smartstring::LazyCompact>;
 pub type Bigram = (Unigram, Unigram);
@@ -44,11 +44,9 @@ impl<'a> Chain<'a> {
             prune_threshold,
 
             hasher: hasher.clone(),
-            chain: BChainMap::with_capacity_and_hasher_in(
-                prune_size / 1000,
-                hasher,
-                unsafe { &*pools[0].get() },
-            ),
+            chain: BChainMap::with_capacity_and_hasher_in(prune_size / 1000, hasher, unsafe {
+                &*pools[0].get()
+            }),
 
             pools,
             active_pool: 0,
