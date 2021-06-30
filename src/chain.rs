@@ -1,21 +1,26 @@
 use crate::clone_in::CloneIn;
 use crate::counter::Counter;
+use crate::unigram;
 
 use bumpalo::Bump;
 use hashbrown::HashMap;
 
-use std::{alloc::AllocError, cell::UnsafeCell, cmp::min, hash::Hash, mem};
+use std::{cell::UnsafeCell, cmp::min, hash::Hash, mem};
 
-// pub type ChainMap = HashMap<Bigram, HashMap<Bigram, Vec<(i32, Option<Unigram>)>>>;
+pub type Unigram = String;
+pub type Bigram = (String, String);
 
-pub type Unigram<'a> = crate::unigram::Unigram<&'a Bump>;
-pub type Bigram<'a> = (Unigram<'a>, Unigram<'a>);
+pub type TopicMap = HashMap<Bigram, Vec<(i32, Option<Unigram>)>>;
+pub type ChainMap = HashMap<Bigram, TopicMap>;
+
+type BUnigram<'a> = unigram::Unigram<&'a Bump>;
+type BBigram<'a> = (BUnigram<'a>, BUnigram<'a>);
 
 type BHashMap<'a, K, V> = HashMap<K, V, ahash::RandomState, &'a Bump>;
 type BVec<'a, T> = Vec<T, &'a Bump>;
 
-type BChainMap<'a> =
-    BHashMap<'a, Bigram<'a>, BHashMap<'a, Bigram<'a>, BVec<'a, (i32, Option<Unigram<'a>>)>>>;
+type BTopicMap<'a> = BHashMap<'a, BBigram<'a>, BVec<'a, (i32, Option<BUnigram<'a>>)>>;
+type BChainMap<'a> = BHashMap<'a, BBigram<'a>, BTopicMap<'a>>;
 
 pub struct Chain<'a> {
     half_para_len: usize,
@@ -64,17 +69,17 @@ impl<'a> Chain<'a> {
         self.active_pool()
     }
 
-    pub fn update(&mut self, words: &[&str]) -> Result<(), AllocError> {
+    pub fn update(&mut self, words: &[&str]) {
         if words.len() < self.half_para_len {
-            return Ok(());
+            return;
         }
 
         let pool = self.active_pool();
 
         let mut seq_num = 0;
         let mut previous_topic_bigram = (
-            Unigram::from_slice_in("", pool)?,
-            Unigram::from_slice_in("", pool)?,
+            BUnigram::from_slice_in("", pool),
+            BUnigram::from_slice_in("", pool),
         );
 
         let mut counter = Counter::new();
@@ -110,24 +115,21 @@ impl<'a> Chain<'a> {
             }
 
             let topic_bigram = (
-                Unigram::from_slice_in(counter.most_frequent(1).unwrap().0, pool)?,
-                Unigram::from_slice_in(counter.most_frequent(2).unwrap().0, pool)?,
+                BUnigram::from_slice_in(counter.most_frequent(1).unwrap().0, pool),
+                BUnigram::from_slice_in(counter.most_frequent(2).unwrap().0, pool),
             );
 
             if topic_bigram != previous_topic_bigram {
                 seq_num = 0;
-                previous_topic_bigram = topic_bigram.clone_in(pool)?;
+                previous_topic_bigram = topic_bigram.clone_in(pool);
             }
 
-            let next_unigram = words
-                .get(i + 2)
-                .map(|&w| Unigram::from_slice_in(w, pool))
-                .transpose()?;
+            let next_unigram = words.get(i + 2).map(|&w| BUnigram::from_slice_in(w, pool));
 
             self.chain
                 .entry((
-                    Unigram::from_slice_in(words[i], pool)?,
-                    Unigram::from_slice_in(words[i + 1], pool)?,
+                    BUnigram::from_slice_in(words[i], pool),
+                    BUnigram::from_slice_in(words[i + 1], pool),
                 ))
                 .or_insert(BHashMap::with_hasher_in(self.hasher.clone(), pool))
                 .entry(topic_bigram)
@@ -138,17 +140,15 @@ impl<'a> Chain<'a> {
         }
 
         if self.allocated_bytes() > self.prune_size {
-            self.prune()?;
+            self.prune();
         }
-
-        Ok(())
     }
 
     fn new_hash_map<K: Hash + Eq, V>(&self, size: usize) -> BHashMap<'a, K, V> {
         BHashMap::with_capacity_and_hasher_in(size, self.hasher.clone(), self.active_pool())
     }
 
-    pub fn prune(&mut self) -> Result<(), AllocError> {
+    pub fn prune(&mut self) {
         let old_pool_id = self.active_pool;
         let new_pool = self.advance_pool();
 
@@ -162,26 +162,20 @@ impl<'a> Chain<'a> {
             for (topic, unigrams) in topic_map.iter() {
                 let mut new_unigrams = BVec::with_capacity_in(unigrams.len(), new_pool);
                 for unigram in unigrams {
-                    let new_unigram = match &unigram.1 {
-                        Some(u) => Some(u.clone_in(new_pool)?),
-                        None => None
-                    };
-
+                    let new_unigram = unigram.1.as_ref().map(|u| u.clone_in(new_pool));
                     new_unigrams.push((unigram.0, new_unigram));
                 }
 
-                new_topic_map.insert(topic.clone_in(new_pool)?, new_unigrams);
+                new_topic_map.insert(topic.clone_in(new_pool), new_unigrams);
             }
 
-            new_chain.insert(bigram.clone_in(new_pool)?, new_topic_map);
+            new_chain.insert(bigram.clone_in(new_pool), new_topic_map);
         }
 
         mem::swap(&mut self.chain, &mut new_chain);
         mem::forget(new_chain);
 
         unsafe { self.reset_pool(old_pool_id) }
-
-        Ok(())
     }
 
     unsafe fn reset_pool(&mut self, id: usize) {
@@ -196,22 +190,22 @@ impl<'a> Chain<'a> {
         self.active_pool().allocated_bytes()
     }
 
-    /*
     pub fn extract_map(&self) -> ChainMap {
         let mut new_chain = ChainMap::with_capacity(self.num_entries());
-        for (bigram, topic_map) in self.chain.iter() {
+        for ((b1, b2), topic_map) in self.chain.iter() {
             let mut new_topic_map = HashMap::with_capacity(topic_map.len());
-            for (topic, unigrams) in topic_map.iter() {
+            for ((t0, t1), unigrams) in topic_map.iter() {
                 let mut new_unigrams = Vec::with_capacity(unigrams.len());
-                new_unigrams.extend_from_slice(unigrams);
+                for (u1, u2) in unigrams {
+                    new_unigrams.push((*u1, u2.as_ref().map(|u| u.into())));
+                }
 
-                new_topic_map.insert(topic.clone(), new_unigrams);
+                new_topic_map.insert((t0.into(), t1.into()), new_unigrams);
             }
 
-            new_chain.insert(bigram.clone(), new_topic_map);
+            new_chain.insert((b1.into(), b2.into()), new_topic_map);
         }
 
         new_chain
     }
-    */
 }

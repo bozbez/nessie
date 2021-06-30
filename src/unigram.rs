@@ -1,7 +1,7 @@
 use crate::clone_in::CloneIn;
 
 use std::{
-    alloc::{AllocError, Allocator, Global, Layout},
+    alloc::{Allocator, Global, Layout},
     fmt::{Debug, Display, Error, Formatter},
     hash::{Hash, Hasher},
     marker::PhantomData,
@@ -85,21 +85,21 @@ impl<A: Allocator> Unigram<A> {
         }
     }
 
-    pub fn from_slice_in(slice: &str, alloc: A) -> Result<Self, AllocError> {
+    pub fn from_slice_in(slice: &str, alloc: A) -> Self {
         if slice.len() > INLINE_CAP {
             unsafe { Self::from_slice_in_boxed(slice, alloc) }
         } else {
-            unsafe { Ok(Self::from_slice_inline(slice)) }
+            unsafe { Self::from_slice_inline(slice) }
         }
     }
 
-    unsafe fn from_slice_in_boxed(slice: &str, alloc: A) -> Result<Self, AllocError> {
+    unsafe fn from_slice_in_boxed(slice: &str, alloc: A) -> Self {
         let mut out = Self {
             raw: MaybeUninit::uninit(),
         };
 
         let layout = Layout::from_size_align_unchecked(slice.len(), 16);
-        let data = alloc.allocate(layout.pad_to_align())?.as_mut_ptr();
+        let data = alloc.allocate(layout.pad_to_align()).unwrap().as_mut_ptr();
 
         copy_nonoverlapping(slice.as_ptr(), data, slice.len());
 
@@ -107,8 +107,7 @@ impl<A: Allocator> Unigram<A> {
         out_data_ptr.write(data);
 
         out.inner_mut().marker = Marker::new_boxed(slice.len());
-
-        Ok(out)
+        out
     }
 
     unsafe fn from_slice_inline(slice: &str) -> Self {
@@ -142,7 +141,7 @@ impl<A: Allocator> Unigram<A> {
 }
 
 impl<A: Allocator + Copy> CloneIn<A> for Unigram<A> {
-    fn clone_in(&self, alloc: A) -> Result<Self, AllocError> {
+    fn clone_in(&self, alloc: A) -> Self {
         if self.is_inline() {
             let mut out = Self {
                 raw: MaybeUninit::uninit(),
@@ -155,7 +154,7 @@ impl<A: Allocator + Copy> CloneIn<A> for Unigram<A> {
                 copy_nonoverlapping(src, dst, size_of::<Self>());
             }
 
-            Ok(out)
+            out
         } else {
             unsafe { Self::from_slice_in_boxed(self.as_str(), alloc) }
         }
@@ -196,9 +195,15 @@ impl<A: Allocator> Display for Unigram<A> {
     }
 }
 
-impl<A: Allocator> Into<String> for Unigram<A> {
-    fn into(self) -> String {
-        self.as_str().into()
+impl<A: Allocator> From<Unigram<A>> for String {
+    fn from(unigram: Unigram<A>) -> Self {
+        unigram.as_str().into()
+    }
+}
+
+impl<A: Allocator> From<&Unigram<A>> for String {
+    fn from(unigram: &Unigram<A>) -> Self {
+        unigram.as_str().into()
     }
 }
 
@@ -224,7 +229,11 @@ impl<A: Allocator> Eq for Unigram<A> {}
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::ptr::NonNull;
+
+    use std::{
+        alloc::AllocError,
+        ptr::NonNull
+    };
 
     #[derive(Clone, Copy)]
     struct TestAllocator();
@@ -255,67 +264,57 @@ mod tests {
     }
 
     #[test]
-    fn test_length() -> Result<(), AllocError> {
+    fn test_length() {
         for s in TEST_STRS {
-            let u = Unigram::from_slice_in(s, Global::default())?;
+            let u = Unigram::from_slice_in(s, Global::default());
             assert_eq!(u.len(), s.len());
         }
-
-        Ok(())
     }
 
     #[test]
-    fn test_inline() -> Result<(), AllocError> {
+    fn test_inline() {
         for s in TEST_STRS {
-            let u = Unigram::from_slice_in(s, Global::default())?;
+            let u = Unigram::from_slice_in(s, Global::default());
             assert_eq!(u.is_inline(), s.len() <= INLINE_CAP);
         }
-
-        Ok(())
     }
 
     #[test]
-    fn test_inline_alloc() -> Result<(), AllocError> {
+    fn test_inline_alloc() {
         let a = TestAllocator();
         for s in TEST_STRS.iter().filter(|s| s.len() <= INLINE_CAP) {
-            let u = Unigram::from_slice_in(s, a)?;
+            let u = Unigram::from_slice_in(s, a);
             assert_eq!(u.is_inline(), true);
         }
-
-        Ok(())
     }
 
     #[test]
     #[should_panic(expected = "attempted to allocate")]
     fn test_box_alloc() {
         let a = TestAllocator();
-        let u = Unigram::from_slice_in(TEST_STRS[4], a).unwrap();
+        let u = Unigram::from_slice_in(TEST_STRS[4], a);
 
         assert_eq!(u.is_inline(), false);
     }
 
     #[test]
-    fn test_eq() -> Result<(), AllocError> {
+    fn test_eq() {
         for s in TEST_STRS {
-            let u1 = Unigram::from_slice_in(s, Global::default())?;
-            let u2 = Unigram::from_slice_in(s, Global::default())?;
+            let u1 = Unigram::from_slice_in(s, Global::default());
+            let u2 = Unigram::from_slice_in(s, Global::default());
 
             assert!(u1 == u2);
             assert!(!(u1 != u2));
         }
-
-        Ok(())
     }
 
     #[test]
-    fn test_eq_str() -> Result<(), AllocError> {
+    fn test_eq_str() {
         for s in TEST_STRS {
-            let u = Unigram::from_slice_in(s, Global::default())?;
+            let u = Unigram::from_slice_in(s, Global::default());
 
             assert!(u.as_str() == s);
             assert!(s == u.as_str());
         }
-
-        Ok(())
     }
 }

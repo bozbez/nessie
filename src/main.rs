@@ -132,7 +132,7 @@ fn main() -> std::io::Result<()> {
         section_times.0 += section_start.elapsed().as_secs_f64();
         section_start = Instant::now();
 
-        chain.update(&words).unwrap();
+        chain.update(&words);
 
         section_times.1 += section_start.elapsed().as_secs_f64();
 
@@ -152,7 +152,7 @@ fn main() -> std::io::Result<()> {
         section_times.1,
     );
 
-    chain.prune().unwrap();
+    chain.prune();
     print_chain_info(&chain, true);
 
     if let Some(output) = opts.output {
@@ -161,8 +161,8 @@ fn main() -> std::io::Result<()> {
         let output = File::create(output)?;
         let mut writer = BufWriter::new(output);
 
-        // let chain_map = chain.extract_map();
-        // serde_pickle::to_writer(&mut writer, &chain_map, true).unwrap();
+        let chain_map = chain.extract_map();
+        serde_pickle::to_writer(&mut writer, &chain_map, true).unwrap();
 
         println!(
             "{:.3}GiB written",
