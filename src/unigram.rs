@@ -1,7 +1,7 @@
 use crate::clone_in::CloneIn;
 
 use std::{
-    alloc::{Allocator, Global, Layout},
+    alloc::{Allocator, Layout},
     fmt::{Debug, Display, Error, Formatter},
     hash::{Hash, Hasher},
     marker::PhantomData,
@@ -16,7 +16,7 @@ const INLINE_CAP: usize = 15;
 const MARKER_LEN_MASK: u8 = 0b0111_1111;
 const MARKER_DISC_MASK: u8 = !MARKER_LEN_MASK;
 
-pub struct Unigram<A: Allocator = Global> {
+pub struct Unigram<A: Allocator> {
     raw: MaybeUninit<Repr<A>>,
 }
 
@@ -28,6 +28,7 @@ struct Repr<A: Allocator> {
     alloc: PhantomData<A>,
 }
 
+#[derive(PartialEq, Eq)]
 struct Marker(u8);
 
 impl Marker {
@@ -140,7 +141,7 @@ impl<A: Allocator> Unigram<A> {
     }
 }
 
-impl<A: Allocator + Copy> CloneIn<A> for Unigram<A> {
+impl<A: Allocator> CloneIn<A> for Unigram<A> {
     fn clone_in(&self, alloc: A) -> Self {
         if self.is_inline() {
             let mut out = Self {
@@ -159,6 +160,10 @@ impl<A: Allocator + Copy> CloneIn<A> for Unigram<A> {
             unsafe { Self::from_slice_in_boxed(self.as_str(), alloc) }
         }
     }
+}
+
+impl<A: Allocator> Drop for Unigram<A> {
+    fn drop(&mut self) {}
 }
 
 impl<A: Allocator> AsRef<str> for Unigram<A> {
@@ -209,8 +214,10 @@ impl<A: Allocator> From<&Unigram<A>> for String {
 
 impl<A: Allocator> PartialEq<Unigram<A>> for Unigram<A> {
     fn eq(&self, other: &Unigram<A>) -> bool {
-        if self.len() != other.len() {
-            return false;
+        unsafe {
+            if self.inner().marker != other.inner().marker {
+                return false;
+            }
         }
 
         if self.is_inline() {
@@ -231,8 +238,8 @@ mod tests {
     use super::*;
 
     use std::{
-        alloc::AllocError,
-        ptr::NonNull
+        alloc::{AllocError, Global},
+        ptr::NonNull,
     };
 
     #[derive(Clone, Copy)]
@@ -259,8 +266,13 @@ mod tests {
 
     #[test]
     fn test_size() {
-        assert_eq!(size_of::<Unigram>(), 16);
-        assert_eq!(size_of::<Unigram>(), INLINE_CAP + 1);
+        assert_eq!(size_of::<Unigram<Global>>(), 16);
+        assert_eq!(size_of::<Unigram<Global>>(), INLINE_CAP + 1);
+
+        assert_eq!(
+            size_of::<Unigram<Global>>(),
+            size_of::<Unigram<TestAllocator>>()
+        );
     }
 
     #[test]
@@ -305,6 +317,17 @@ mod tests {
 
             assert!(u1 == u2);
             assert!(!(u1 != u2));
+        }
+    }
+
+    #[test]
+    fn test_neq() {
+        for (s1, s2) in TEST_STRS.iter().zip(&TEST_STRS[1..]) {
+            let u1 = Unigram::from_slice_in(s1, Global::default());
+            let u2 = Unigram::from_slice_in(s2, Global::default());
+
+            assert!(u1 != u2);
+            assert!(!(u1 == u2));
         }
     }
 
