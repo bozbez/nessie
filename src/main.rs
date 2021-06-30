@@ -1,7 +1,9 @@
-#![feature(allocator_api)]
+#![feature(allocator_api, slice_ptr_get)]
 
 mod chain;
 mod counter;
+mod unigram;
+mod clone_in;
 
 use chain::Chain;
 use clap::Clap;
@@ -130,7 +132,7 @@ fn main() -> std::io::Result<()> {
         section_times.0 += section_start.elapsed().as_secs_f64();
         section_start = Instant::now();
 
-        chain.update(&words);
+        chain.update(&words).unwrap();
 
         section_times.1 += section_start.elapsed().as_secs_f64();
 
@@ -150,7 +152,7 @@ fn main() -> std::io::Result<()> {
         section_times.1,
     );
 
-    chain.prune();
+    chain.prune().unwrap();
     print_chain_info(&chain, true);
 
     if let Some(output) = opts.output {
@@ -159,8 +161,8 @@ fn main() -> std::io::Result<()> {
         let output = File::create(output)?;
         let mut writer = BufWriter::new(output);
 
-        let chain_map = chain.extract_map();
-        serde_pickle::to_writer(&mut writer, &chain_map, true).unwrap();
+        // let chain_map = chain.extract_map();
+        // serde_pickle::to_writer(&mut writer, &chain_map, true).unwrap();
 
         println!(
             "{:.3}GiB written",
