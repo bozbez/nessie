@@ -2,20 +2,36 @@
 
 mod chain;
 mod counter;
-mod unigram;
-mod clone_in;
 
-use chain::Chain;
+use chain::{Bigram, Chain, Unigram};
+
 use clap::Clap;
+use crossbeam::channel::{bounded, Receiver, Sender};
 use deunicode::deunicode;
 use hashbrown::HashSet;
+
+use mongodb::{
+    options::{Acknowledgment, InsertManyOptions, WriteConcern},
+    sync::Client,
+};
+
 use regex::Regex;
+use serde::Serialize;
 
 use std::fs::File;
-use std::io::{prelude::*, BufReader, BufWriter};
+use std::io::{prelude::*, BufReader};
+use std::thread;
 use std::time::Instant;
 
-#[derive(Clap)]
+#[derive(Serialize)]
+struct Doc {
+    bigram: Bigram,
+    topic: Bigram,
+
+    next_unigrams: Vec<(i32, Option<Unigram>)>,
+}
+
+#[derive(Clap, Clone)]
 struct Opts {
     input: String,
 
@@ -31,11 +47,17 @@ struct Opts {
     #[clap(long, default_value = "64")]
     half_para_len: usize,
 
-    #[clap(long, default_value = "2.0")]
-    prune_size_gib: f64,
+    #[clap(long, default_value = "256")]
+    chain_batch_period: usize,
 
-    #[clap(long, default_value = "16")]
-    prune_threshold: usize,
+    #[clap(long, default_value = "mongodb://localhost:27017")]
+    mongo_uri: String,
+
+    #[clap(long, default_value = "local")]
+    mongo_db: String,
+
+    #[clap(long, default_value = "nessie")]
+    mongo_collection: String,
 }
 
 fn print_opts(opts: &Opts) {
@@ -46,10 +68,7 @@ fn print_opts(opts: &Opts) {
         opts.stop_words
     );
 
-    println!(
-        "half paragraph length: {}, prune threshold: {}, prune size: {} GiB",
-        opts.half_para_len, opts.prune_threshold, opts.prune_size_gib
-    );
+    println!("half paragraph length: {}", opts.half_para_len);
 }
 
 struct LineProcessor<'a> {
@@ -74,27 +93,97 @@ impl<'a> LineProcessor<'a> {
         line.replace(" th ", " nth ")
     }
 
-    fn split<'b>(&self, line: &'b str) -> Vec<&'b str> {
+    fn split(&self, line: String) -> Vec<String> {
         line.split_ascii_whitespace()
             .filter(|s| !self.stop_words.contains(s))
-            .collect()
+            .map(|s| s.into())
+            .collect::<Vec<String>>()
     }
 }
 
-fn print_chain_info(chain: &Chain, newline: bool) {
-    print!(
-        "{:>7} entries, ~{:.3} GiB allocated\r",
-        chain.num_entries(),
-        chain.allocated_bytes() as f64 / bytesize::GIB as f64
-    );
+fn worker(opts: Opts, rx: Receiver<Vec<String>>, tx: Sender<Chain>) {
+    let mut iteration = 0;
+    let mut chain = Chain::new(opts.half_para_len);
 
-    if newline {
-        println!();
+    loop {
+        let words = match rx.recv() {
+            Ok(words) => words,
+            Err(_) => break,
+        };
+
+        chain.update(words);
+
+        if (iteration + 1) % opts.print_period == 0 {
+            println!("{:>7}: {} entries", iteration + 1, chain.num_entries());
+        }
+
+        if (iteration + 1) % opts.chain_batch_period == 0 {
+            tx.send(chain).expect("could not forward chain");
+            chain = Chain::new(opts.half_para_len);
+        }
+
+        iteration += 1;
+    }
+
+    tx.send(chain).expect("could not forward chain");
+}
+
+fn chain_converter(rx: Receiver<Chain>, tx: Sender<Vec<Doc>>) {
+    loop {
+        let chain = match rx.recv() {
+            Ok(chain) => chain,
+            Err(_) => break,
+        };
+
+        let mut docs = Vec::new();
+        for (bigram, mut topic_map) in chain.extract_chain_map().drain() {
+            for (topic, next_unigrams) in topic_map.drain() {
+                docs.push(Doc {
+                    bigram: bigram.clone(),
+                    topic,
+
+                    next_unigrams,
+                });
+            }
+        }
+
+        tx.send(docs).expect("could not forward docs");
+    }
+}
+
+fn inserter(opts: Opts, rx: Receiver<Vec<Doc>>) {
+    let client = Client::with_uri_str(opts.mongo_uri).expect("could not connect to db");
+
+    let database = client.database(&opts.mongo_db);
+    let collection = database.collection::<Doc>(&opts.mongo_collection);
+
+    loop {
+        let docs = match rx.recv() {
+            Ok(docs) => docs,
+            Err(_) => break,
+        };
+
+        let num_docs = docs.len();
+        let start = Instant::now();
+
+        collection
+            .insert_many(docs, None)
+            .expect("failed to insert into db");
+
+        let duration = start.elapsed();
+        println!(
+            "inserted {} docs in {:.3}s",
+            num_docs,
+            duration.as_secs_f64()
+        );
     }
 }
 
 fn main() -> std::io::Result<()> {
     let opts = Opts::parse();
+
+    let worker_opts = opts.clone();
+    let inserter_opts = opts.clone();
 
     print_opts(&opts);
     println!();
@@ -110,16 +199,18 @@ fn main() -> std::io::Result<()> {
     let input = File::open(opts.input)?;
     let reader = BufReader::new(input);
 
-    let mut chain = Chain::new(
-        opts.half_para_len,
-        (opts.prune_size_gib * (bytesize::GIB as f64)) as usize,
-        opts.prune_threshold,
-    );
+    let (tx_line, rx_line) = bounded::<Vec<String>>(8);
+    let (tx_chain, rx_chain) = bounded::<Chain>(2);
+    let (tx_doc, rx_doc) = bounded::<Vec<Doc>>(2);
+
+    let worker = thread::spawn(move || worker(worker_opts, rx_line, tx_chain));
+    let chain_converter = thread::spawn(move || chain_converter(rx_chain, tx_doc));
+    let inserter = thread::spawn(move || inserter(inserter_opts, rx_doc));
 
     let start = Instant::now();
     let mut section_times = (0f64, 0f64);
 
-    for (i, line) in reader.lines().enumerate() {
+    for line in reader.lines() {
         let mut section_start = Instant::now();
 
         let line = match line {
@@ -127,48 +218,32 @@ fn main() -> std::io::Result<()> {
             Err(_) => break,
         };
 
-        let words = line_processor.split(&line);
+        let words = line_processor.split(line);
 
         section_times.0 += section_start.elapsed().as_secs_f64();
         section_start = Instant::now();
 
-        chain.update(&words);
+        tx_line.send(words).expect("could not sending line");
 
         section_times.1 += section_start.elapsed().as_secs_f64();
-
-        if (i + 1) % opts.print_period == 0 {
-            print!("{:>7}: {} ... ", i + 1, &line[0..72],);
-            print_chain_info(&chain, false);
-            print!("\r");
-        }
     }
+
+    drop(tx_line);
+
+    worker.join().expect("could not join worker");
+    chain_converter
+        .join()
+        .expect("could not join chain converter");
+    inserter.join().expect("could not join inserter");
 
     let duration = start.elapsed();
 
-    print!(
-        "\n\nfinished in {:.3}s ({:.3}s, {:.3}s), cleaning up... ",
+    println!(
+        "\nfinished in {:.3}s ({:.3}s, {:.3}s), cleaning up... ",
         duration.as_secs_f64(),
         section_times.0,
         section_times.1,
     );
-
-    chain.prune();
-    print_chain_info(&chain, true);
-
-    if let Some(output) = opts.output {
-        print!("writing to {}... ", output);
-
-        let output = File::create(output)?;
-        let mut writer = BufWriter::new(output);
-
-        let chain_map = chain.extract_map();
-        serde_pickle::to_writer(&mut writer, &chain_map, true).unwrap();
-
-        println!(
-            "{:.3}GiB written",
-            writer.get_ref().metadata()?.len() as f64 / bytesize::GIB as f64
-        );
-    }
 
     Ok(())
 }
