@@ -3,32 +3,33 @@
 mod chain;
 mod counter;
 
-use chain::{Bigram, Chain, Unigram};
+use chain::{Bigram, Chain, SeqUnigram};
 
 use clap::Clap;
 use crossbeam::channel::{bounded, Receiver, Sender};
 use deunicode::deunicode;
 use hashbrown::HashSet;
+use regex::Regex;
 
-use mongodb::{
-    options::{Acknowledgment, InsertManyOptions, WriteConcern},
-    sync::Client,
+use bytes::{BufMut, BytesMut};
+
+use postgres::{
+    binary_copy::BinaryCopyInWriter,
+    types::{Field, IsNull, Kind, ToSql, Type},
+    Client, NoTls,
 };
 
-use regex::Regex;
-use serde::Serialize;
-
+use std::error::Error;
 use std::fs::File;
 use std::io::{prelude::*, BufReader};
 use std::thread;
 use std::time::Instant;
 
-#[derive(Serialize)]
 struct Doc {
     bigram: Bigram,
     topic: Bigram,
 
-    next_unigrams: Vec<(i32, Option<Unigram>)>,
+    next_unigrams: Vec<SeqUnigram>,
 }
 
 #[derive(Clap, Clone)]
@@ -50,14 +51,11 @@ struct Opts {
     #[clap(long, default_value = "256")]
     chain_batch_period: usize,
 
-    #[clap(long, default_value = "mongodb://localhost:27017")]
-    mongo_uri: String,
+    #[clap(long, default_value = "host=/var/run/postgresql user=nessie")]
+    postgres_conn: String,
 
-    #[clap(long, default_value = "local")]
-    mongo_db: String,
-
-    #[clap(long, default_value = "nessie")]
-    mongo_collection: String,
+    #[clap(long, default_value = "chain")]
+    postgres_table: String,
 }
 
 fn print_opts(opts: &Opts) {
@@ -152,10 +150,50 @@ fn chain_converter(rx: Receiver<Chain>, tx: Sender<Vec<Doc>>) {
 }
 
 fn inserter(opts: Opts, rx: Receiver<Vec<Doc>>) {
-    let client = Client::with_uri_str(opts.mongo_uri).expect("could not connect to db");
+    let mut client =
+        Client::connect(&opts.postgres_conn, NoTls).expect("could not connect to postgres");
 
-    let database = client.database(&opts.mongo_db);
-    let collection = database.collection::<Doc>(&opts.mongo_collection);
+    let bigram_oid_row = client
+        .query_one("SELECT oid FROM pg_type WHERE typname = 'bigram'", &[])
+        .expect("could not query bigram type oid");
+
+    let bigram_type = Type::new(
+        String::from("bigram"),
+        bigram_oid_row.get("oid"),
+        Kind::Composite(vec![
+            Field::new(String::from("first"), Type::TEXT),
+            Field::new(String::from("second"), Type::TEXT),
+        ]),
+        String::from("public"),
+    );
+
+    let seq_unigram_oid_row = client
+        .query_one("SELECT oid FROM pg_type WHERE typname = 'seq_unigram'", &[])
+        .expect("could not query seq_unigram type oid");
+
+    let seq_unigram_type = Type::new(
+        String::from("seq_unigram"),
+        seq_unigram_oid_row.get("oid"),
+        Kind::Composite(vec![
+            Field::new(String::from("seq_num"), Type::INT4),
+            Field::new(String::from("unigram"), Type::TEXT),
+        ]),
+        String::from("public"),
+    );
+
+    let seq_unigram_array_oid_row = client
+        .query_one(
+            "SELECT oid FROM pg_type WHERE typname = '_seq_unigram'",
+            &[],
+        )
+        .expect("could not query seq_unigram array type oid");
+
+    let seq_unigram_array_type = Type::new(
+        String::from("_seq_unigram"),
+        seq_unigram_array_oid_row.get("oid"),
+        Kind::Array(seq_unigram_type),
+        String::from("public"),
+    );
 
     loop {
         let docs = match rx.recv() {
@@ -166,9 +204,28 @@ fn inserter(opts: Opts, rx: Receiver<Vec<Doc>>) {
         let num_docs = docs.len();
         let start = Instant::now();
 
-        collection
-            .insert_many(docs, None)
-            .expect("failed to insert into db");
+        let writer = client
+            .copy_in("COPY chain FROM stdin (FORMAT BINARY)")
+            .expect("could not create binary row writer");
+
+        let mut bin_writer = BinaryCopyInWriter::new(
+            writer,
+            &[
+                bigram_type.clone(),
+                bigram_type.clone(),
+                seq_unigram_array_type.clone(),
+            ],
+        );
+
+        for doc in docs {
+            bin_writer
+                .write(&[&doc.bigram, &doc.topic, &doc.next_unigrams.as_slice()])
+                .expect("could not write binary row");
+        }
+
+        bin_writer
+            .finish()
+            .expect("could not finish binary row writier");
 
         let duration = start.elapsed();
         println!(

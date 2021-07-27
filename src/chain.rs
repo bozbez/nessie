@@ -3,12 +3,39 @@ use crate::counter::Counter;
 use hashbrown::HashMap;
 use smartstring::{LazyCompact, SmartString};
 
+use postgres_types::ToSql;
+
 use std::cmp::min;
 
-pub type Unigram = SmartString<LazyCompact>;
-pub type Bigram = (Unigram, Unigram);
+pub type Unigram = String; // SmartString<LazyCompact>;
 
-pub type TopicMap = HashMap<Bigram, Vec<(i32, Option<Unigram>)>>;
+#[derive(Debug, ToSql, Hash, Clone, Eq, Ord, PartialEq, PartialOrd)]
+#[postgres(name = "bigram")]
+pub struct Bigram {
+    first: Unigram,
+    second: Unigram,
+}
+
+impl Bigram {
+    pub fn new(first: Unigram, second: Unigram) -> Self {
+        Bigram { first, second }
+    }
+}
+
+#[derive(Debug, ToSql, Eq, Ord, PartialEq, PartialOrd)]
+#[postgres(name = "seq_unigram")]
+pub struct SeqUnigram {
+    seq_num: i32,
+    unigram: Option<Unigram>,
+}
+
+impl SeqUnigram {
+    pub fn new(seq_num: i32, unigram: Option<Unigram>) -> Self {
+        SeqUnigram { seq_num, unigram }
+    }
+}
+
+pub type TopicMap = HashMap<Bigram, Vec<SeqUnigram>>;
 pub type ChainMap = HashMap<Bigram, TopicMap>;
 
 pub struct Chain {
@@ -38,7 +65,7 @@ impl Chain {
         }
 
         let mut seq_num = 0;
-        let mut previous_topic_bigram = (Unigram::new(), Unigram::new());
+        let mut previous_topic_bigram = Bigram::new(Unigram::new(), Unigram::new());
 
         let mut counter: Counter<&str> = Counter::new();
 
@@ -72,7 +99,7 @@ impl Chain {
                 break;
             }
 
-            let topic_bigram = (
+            let topic_bigram = Bigram::new(
                 counter.most_frequent(1).unwrap().0.into(),
                 counter.most_frequent(2).unwrap().0.into(),
             );
@@ -83,11 +110,14 @@ impl Chain {
             }
 
             self.chain
-                .entry((words[i].clone().into(), words[i + 1].clone().into()))
+                .entry(Bigram::new(words[i].clone().into(), words[i + 1].clone().into()))
                 .or_insert(HashMap::new())
                 .entry(topic_bigram)
                 .or_insert(Vec::new())
-                .push((seq_num, words.get(i + 2).map(|w| w.clone().into())));
+                .push(SeqUnigram::new(
+                    seq_num,
+                    words.get(i + 2).map(|w| w.clone().into()),
+                ));
 
             seq_num += 1;
         }
