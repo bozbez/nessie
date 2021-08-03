@@ -1,39 +1,8 @@
 use crate::counter::Counter;
+use crate::types::*;
 
 use hashbrown::HashMap;
-use smartstring::{LazyCompact, SmartString};
-
-use postgres_types::ToSql;
-
 use std::cmp::min;
-
-pub type Unigram = String; // SmartString<LazyCompact>;
-
-#[derive(Debug, ToSql, Hash, Clone, Eq, Ord, PartialEq, PartialOrd)]
-#[postgres(name = "bigram")]
-pub struct Bigram {
-    first: Unigram,
-    second: Unigram,
-}
-
-impl Bigram {
-    pub fn new(first: Unigram, second: Unigram) -> Self {
-        Bigram { first, second }
-    }
-}
-
-#[derive(Debug, ToSql, Eq, Ord, PartialEq, PartialOrd)]
-#[postgres(name = "seq_unigram")]
-pub struct SeqUnigram {
-    seq_num: i32,
-    unigram: Option<Unigram>,
-}
-
-impl SeqUnigram {
-    pub fn new(seq_num: i32, unigram: Option<Unigram>) -> Self {
-        SeqUnigram { seq_num, unigram }
-    }
-}
 
 pub type TopicMap = HashMap<Bigram, Vec<SeqUnigram>>;
 pub type ChainMap = HashMap<Bigram, TopicMap>;
@@ -110,7 +79,10 @@ impl Chain {
             }
 
             self.chain
-                .entry(Bigram::new(words[i].clone().into(), words[i + 1].clone().into()))
+                .entry(Bigram::new(
+                    words[i].clone().into(),
+                    words[i + 1].clone().into(),
+                ))
                 .or_insert(HashMap::new())
                 .entry(topic_bigram)
                 .or_insert(Vec::new())

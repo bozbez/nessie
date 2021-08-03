@@ -108,3 +108,9 @@ impl<T: Eq + Hash + Clone> Counter<T> {
         self.items.get(n - 1)
     }
 }
+
+impl<T: Eq + Hash + Clone> Default for Counter<T> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
