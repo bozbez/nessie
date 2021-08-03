@@ -11,13 +11,13 @@ pub struct LineProcessor {
 
 impl LineProcessor {
     pub fn new(stop_words: String) -> Self {
-        let stop_words_clean = Regex::new(r"[^\w\s]")
+        let stop_words_clean = Regex::new(r"[^a-zA-Z\s]")
             .unwrap()
             .replace_all(&stop_words, "")
             .to_string();
 
         LineProcessor {
-            special_chars_re: Regex::new(r"[^\w\s]").unwrap(),
+            special_chars_re: Regex::new(r"[^a-zA-Z\s]").unwrap(),
             stop_words: stop_words_clean
                 .split_ascii_whitespace()
                 .map(|s| s.into())
@@ -31,9 +31,11 @@ impl LineProcessor {
         line = self.special_chars_re.replace_all(&line, "").to_string();
         line.make_ascii_lowercase();
 
-        line.split_ascii_whitespace()
+        let mut myvec: Vec<String> = line.split_ascii_whitespace()
             .map(|s| s.into())
             .filter(|s| !self.stop_words.contains(s))
-            .collect::<Vec<String>>()
+            .collect::<Vec<String>>();
+        myvec.dedup();
+        myvec
     }
 }
